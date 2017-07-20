@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package message;
+
+option java_package = "com.thoughtworks.message";
+option java_outer_classname = "MessageProtos";
+
+message MsgId {
+    string ReqId = 1;
+    string FOId = 2;
+}
+
+message CtrlMsg {
+    string FOName = 1;
+    map<string, int32> Statistics = 2;
+}
+
+enum DataType {
+    TRADE_DATA = 0;
+    MARKET_DATA = 1;
+}
+
+message DataMsg {
+    DataType Type = 1;
+    string Id = 2;
+    string Value = 3;
+}
