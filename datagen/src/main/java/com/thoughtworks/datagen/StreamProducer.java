@@ -93,10 +93,8 @@ public class StreamProducer {
                     Thread.sleep(random.nextInt(1000));
                 }
                 System.out.println("Data committed: " + i);
-            } catch (KafkaException ex) {
+            } catch (KafkaException | InterruptedException ex) {
                 ex.printStackTrace();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
             }
         }
     }
