@@ -16,10 +16,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.function.Function3;
 import org.apache.spark.sql.hive.HiveContext;
 import org.apache.spark.streaming.*;
-import org.apache.spark.streaming.api.java.JavaMapWithStateDStream;
-import org.apache.spark.streaming.api.java.JavaPairDStream;
-import org.apache.spark.streaming.api.java.JavaPairInputDStream;
-import org.apache.spark.streaming.api.java.JavaStreamingContext;
+import org.apache.spark.streaming.api.java.*;
 import org.apache.spark.streaming.kafka.KafkaUtils;
 import org.apache.spark.util.ManualClock;
 import scala.Tuple2;
@@ -88,15 +85,21 @@ public class StreamConsumer {
                     return new Tuple2<>(msgId, ctrlState.substract(dataState));
                 });
 
-        JavaPairDStream<MsgId, CompletionChecker> successStream = checkResultStream
-                .filter(tup -> tup._2().isCompleted());
-
-        successStream
+        deltaStream(checkResultStream)
                 .map(tup -> tup._1().getReqId() + " Finished.")
                 .print();
 
         jssc.start();
         jssc.awaitTermination();
+    }
+
+    private static JavaPairDStream<MsgId, Integer> deltaStream(JavaPairDStream<MsgId, CompletionChecker> checkResultStream) {
+        return checkResultStream
+                .filter(tup1 -> tup1._2().isCompleted())
+                .window(Durations.seconds(2))
+                .mapValues(cc -> 1)
+                .reduceByKey((a, b) -> a + b)
+                .filter(tup -> tup._2() == 1);
     }
 
     private static JavaPairInputDStream<MsgId, DataMsg> createDataStream(JavaStreamingContext jssc) {
