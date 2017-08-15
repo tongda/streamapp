@@ -10,18 +10,19 @@ import com.thoughtworks.message.MessageProtos;
 import com.thoughtworks.message.MessageProtos.CtrlMsg;
 import com.thoughtworks.message.MessageProtos.DataMsg;
 import com.thoughtworks.message.MessageProtos.MsgId;
-import org.apache.commons.pool2.impl.GenericKeyedObjectPool;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaPairRDD;
-import org.apache.spark.api.java.function.Function3;
-import org.apache.spark.sql.hive.HiveContext;
-import org.apache.spark.streaming.*;
-import org.apache.spark.streaming.api.java.*;
+import org.apache.spark.streaming.Durations;
+import org.apache.spark.streaming.State;
+import org.apache.spark.streaming.StateSpec;
+import org.apache.spark.streaming.api.java.JavaMapWithStateDStream;
+import org.apache.spark.streaming.api.java.JavaPairDStream;
+import org.apache.spark.streaming.api.java.JavaPairInputDStream;
+import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import org.apache.spark.streaming.kafka.KafkaUtils;
-import org.apache.spark.util.ManualClock;
 import scala.Tuple2;
 
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Created by dtong on 20/07/2017.
@@ -35,17 +36,24 @@ public class StreamConsumer {
     static class Mappers {
         public static CompletionChecker ctrlMapper(
                 MsgId msgId, Optional<CtrlMsg> ctrlMsgOptional, State<CompletionChecker> ctrlMsgState) {
-            Map<String, Integer> stats = ctrlMsgOptional.get().getStatisticsMap();
-            CompletionChecker checker =
-                    new CompletionChecker(
-                            stats.get(MessageProtos.DataType.TRADE_DATA.name()),
-                            stats.get(MessageProtos.DataType.MARKET_DATA.name()));
-            ctrlMsgState.update(checker);
-            return checker;
+            if (ctrlMsgOptional.isPresent()) {
+                Map<String, Integer> stats = ctrlMsgOptional.get().getStatisticsMap();
+                CompletionChecker checker =
+                        new CompletionChecker(
+                                stats.get(MessageProtos.DataType.TRADE_DATA.name()),
+                                stats.get(MessageProtos.DataType.MARKET_DATA.name()));
+                ctrlMsgState.update(checker);
+                return checker;
+            } else {
+                if (ctrlMsgState.exists() && !ctrlMsgState.isTimingOut()) {
+                    ctrlMsgState.remove();
+                }
+                return null;
+            }
         }
 
         public static Tuple2<MsgId, CompletionChecker> dataMapper(
-                MsgId msgId, Optional<DataMsg> dataMsg, State<CompletionChecker> state) {
+                MsgId msgId, java.util.Optional<DataMsg> dataMsg, State<CompletionChecker> state) {
             CompletionChecker checker;
             if (!state.exists()) {
                 checker = CompletionChecker.empty();
@@ -55,6 +63,30 @@ public class StreamConsumer {
             CompletionChecker updated = checker.consume(dataMsg.get().getType());
             state.update(updated);
             return new Tuple2<>(msgId, updated);
+        }
+
+        public static Tuple2<MsgId, CompletionChecker> joinMapper(
+                MsgId msgId, Optional<Tuple2<Optional<DataMsg>, Optional<CompletionChecker>>> tup,
+                State<Tuple2<CompletionChecker, CompletionChecker>> stateTypeState) {
+            CompletionChecker dataChecker = tup.get()._1()
+                    .transform(CompletionChecker::count)
+                    .or(new CompletionChecker(0, 0));
+            CompletionChecker ctrlChecker = tup.get()._2()
+                    .or(new CompletionChecker(0, 0));
+
+            if (!stateTypeState.exists()) {
+                stateTypeState.update(new Tuple2<>(ctrlChecker, dataChecker));
+            } else {
+                Tuple2<CompletionChecker, CompletionChecker> oldTup = stateTypeState.get();
+                CompletionChecker newDataChecker = oldTup._2().plus(dataChecker);
+                stateTypeState.update(new Tuple2<>(ctrlChecker, newDataChecker));
+            }
+            if (stateTypeState.get()._1().substract(stateTypeState.get()._2()).isCompleted()) {
+                stateTypeState.remove();
+                return new Tuple2<>(msgId, dataChecker);
+            } else {
+                return null;
+            }
         }
     }
 
@@ -67,27 +99,34 @@ public class StreamConsumer {
         JavaPairInputDStream<MsgId, CtrlMsg> ctrlStream = createCtrlStream(jssc);
         JavaPairInputDStream<MsgId, DataMsg> dataStream = createDataStream(jssc);
 
+        // TODO: We can remove the state for this stream.
         JavaMapWithStateDStream<MsgId, CtrlMsg, CompletionChecker, CompletionChecker> ctrlStateStream =
-                ctrlStream.mapWithState(StateSpec.function(Mappers::ctrlMapper));
+                ctrlStream.mapWithState(StateSpec.function(Mappers::ctrlMapper).timeout(Durations.seconds(20)));
         JavaPairDStream<MsgId, CompletionChecker> ctrlSnapStream = ctrlStateStream.stateSnapshots();
 
-        JavaMapWithStateDStream<MsgId, DataMsg, CompletionChecker, Tuple2<MsgId, CompletionChecker>> dataStateStream =
-                dataStream.mapWithState(StateSpec.function(Mappers::dataMapper));
-
-        JavaPairDStream<MsgId, CompletionChecker> dataSnapStream = dataStateStream.stateSnapshots();
-
-        JavaPairDStream<MsgId, CompletionChecker> checkResultStream =
-                ctrlSnapStream.join(dataSnapStream).mapToPair(tup -> {
-                    MsgId msgId = tup._1();
-                    Tuple2<CompletionChecker, CompletionChecker> checkerPair = tup._2();
-                    CompletionChecker ctrlState = checkerPair._1();
-                    CompletionChecker dataState = checkerPair._2();
-                    return new Tuple2<>(msgId, ctrlState.substract(dataState));
-                });
-
-        deltaStream(checkResultStream)
+        dataStream.fullOuterJoin(ctrlSnapStream)
+                .mapWithState(StateSpec.function(Mappers::joinMapper).timeout(Durations.seconds(20)))
+                .filter(Objects::nonNull)
                 .map(tup -> tup._1().getReqId() + " Finished.")
                 .print();
+
+//        JavaMapWithStateDStream<MsgId, DataMsg, CompletionChecker, Tuple2<MsgId, CompletionChecker>> dataStateStream =
+//                dataStream.mapWithState(StateSpec.function(Mappers::dataMapper));
+//
+//        JavaPairDStream<MsgId, CompletionChecker> dataSnapStream = dataStateStream.stateSnapshots();
+//
+//        JavaPairDStream<MsgId, CompletionChecker> checkResultStream =
+//                ctrlSnapStream.join(dataSnapStream).mapToPair(tup -> {
+//                    MsgId msgId = tup._1();
+//                    Tuple2<CompletionChecker, CompletionChecker> checkerPair = tup._2();
+//                    CompletionChecker ctrlState = checkerPair._1();
+//                    CompletionChecker dataState = checkerPair._2();
+//                    return new Tuple2<>(msgId, ctrlState.substract(dataState));
+//                });
+//
+//        deltaStream(checkResultStream)
+//                .map(tup -> tup._1().getReqId() + " Finished.")
+//                .print();
 
         jssc.start();
         jssc.awaitTermination();

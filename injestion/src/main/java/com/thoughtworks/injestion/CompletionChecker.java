@@ -61,4 +61,21 @@ public class CompletionChecker implements Serializable {
     public static CompletionChecker empty() {
         return new CompletionChecker(0, 0);
     }
+
+    public static CompletionChecker count(MessageProtos.DataMsg msg) {
+        switch (msg.getType()) {
+            case TRADE_DATA:
+                return new CompletionChecker(1, 0);
+            case MARKET_DATA:
+                return new CompletionChecker(0, 1);
+            default:
+                return new CompletionChecker(0, 0);
+        }
+    }
+
+    public CompletionChecker plus(CompletionChecker other) {
+        return new CompletionChecker(
+                this.numTrades + other.numTrades,
+                this.numMarketData + other.numMarketData);
+    }
 }
